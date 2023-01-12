@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"encoding/json"
-	"os"
 	"time"
 
 	"github.com/ChatGPT-Hackers/ChatGPT-API-server/types"
@@ -28,7 +27,15 @@ func API_ask(c *gin.Context) {
 		})
 		return
 	}
-	if c.Request.Header["Authorization"][0] != os.Args[2] {
+	// Check if API key is valid
+	verified, err := utils.VerifyToken(c.Request.Header["Authorization"][0])
+	if err != nil {
+		c.JSON(500, gin.H{
+			"error": "Failed to verify API key",
+		})
+		return
+	}
+	if !verified {
 		c.JSON(401, gin.H{
 			"error": "Invalid API key",
 		})
@@ -59,19 +66,45 @@ func API_ask(c *gin.Context) {
 		})
 		return
 	}
+	connectionPool.Mu.RUnlock()
 	if request.ConversationId == "" {
-		// Find connection with the lowest load and where heartbeat is after last message time
-		for _, conn := range connectionPool.Connections {
-			if connection == nil || conn.LastMessageTime.Before(connection.LastMessageTime) {
-				if conn.Heartbeat.After(conn.LastMessageTime) {
-					connection = conn
+		// Retry 3 times before giving up
+		var succeeded bool = false
+		for i := 0; i < 3; i++ {
+			// Find connection with the lowest load and where heartbeat is after last message time
+			connectionPool.Mu.RLock()
+			for _, conn := range connectionPool.Connections {
+				if connection == nil || conn.LastMessageTime.Before(connection.LastMessageTime) {
+					if conn.Heartbeat.After(conn.LastMessageTime) {
+						connection = conn
+					}
 				}
 			}
+			connectionPool.Mu.RUnlock()
+			// Check if connection was found
+			if connection == nil {
+				c.JSON(503, gin.H{
+					"error": "No available clients",
+				})
+				return
+			}
+			// Ping before sending request
+			var pingSucceeded bool = ping(connection.Id)
+			if !pingSucceeded {
+				// Ping failed. Try again
+				connectionPool.Delete(connection.Id)
+				succeeded = false
+				connection = nil
+				continue
+			} else {
+				succeeded = true
+				break
+			}
 		}
-		// Check if connection was found
-		if connection == nil {
+		if !succeeded {
+			// Delete connection
 			c.JSON(503, gin.H{
-				"error": "No available clients",
+				"error": "Ping failed",
 			})
 			return
 		}
@@ -97,14 +130,13 @@ func API_ask(c *gin.Context) {
 				return
 			}
 		}
-	}
-	connectionPool.Mu.RUnlock()
-	// Ping before sending request
-	if !ping(connection.Id) {
-		c.JSON(503, gin.H{
-			"error": "Ping failed",
-		})
-		return
+		// Ping before sending request
+		if !ping(connection.Id) {
+			c.JSON(503, gin.H{
+				"error": "Ping failed",
+			})
+			return
+		}
 	}
 	message := types.Message{
 		Id:      utils.GenerateId(),
@@ -185,7 +217,6 @@ func API_getConnections(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"connections": connections,
 	})
-	return
 }
 
 func ping(connection_id string) bool {
@@ -198,21 +229,17 @@ func ping(connection_id string) bool {
 			Id:      id,
 			Message: "ping",
 		}
+		connection.Ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 		err := connection.Ws.WriteJSON(send)
 		if err != nil {
-			// Delete connection
-			connectionPool.Delete(connection_id)
 			return false
 		}
 		// Wait for response with a timeout
 		for {
 			// Read message
 			var receive types.Message
-			connection.Ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 			err = connection.Ws.ReadJSON(&receive)
 			if err != nil {
-				// Delete connection
-				connectionPool.Delete(connection_id)
 				return false
 			}
 			// Check if the message is the response

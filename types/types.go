@@ -48,6 +48,9 @@ func (p *ConnectionPool) Get(id string) (*Connection, bool) {
 	p.Mu.RLock()
 	defer p.Mu.RUnlock()
 	conn, ok := p.Connections[id]
+	if conn == nil {
+		ok = false
+	}
 	return conn, ok
 }
 
@@ -57,10 +60,11 @@ func (p *ConnectionPool) Set(conn *Connection) {
 	p.Connections[conn.Id] = conn
 }
 
-func (p *ConnectionPool) Delete(id string) {
+func (p *ConnectionPool) Delete(id string) error {
 	p.Mu.Lock()
 	defer p.Mu.Unlock()
 	delete(p.Connections, id)
+	return nil
 }
 
 func NewConnectionPool() *ConnectionPool {
